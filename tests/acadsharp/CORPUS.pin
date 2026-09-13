@@ -1,0 +1,11 @@
+# The libviprs-dep commit this conformance corpus is read from.
+#
+# Pinned, not floating, for the reason the corpus itself is committed over
+# there: a DWG header carries creation and update timestamps, so a fixture
+# regenerated upstream is a different file with a different digest, and a
+# comparison against "whatever main holds today" cannot be reproduced.
+#
+# scripts/fetch-acadsharp-corpus.sh reads this file.
+repo   = https://github.com/libviprs/libviprs-dep
+commit = 543cdafe7dca0cc7b22d76706b9b7f4017f1e85b
+path   = acadsharp/tests
