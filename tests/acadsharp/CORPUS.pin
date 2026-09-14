@@ -7,5 +7,5 @@
 #
 # scripts/fetch-acadsharp-corpus.sh reads this file.
 repo   = https://github.com/libviprs/libviprs-dep
-commit = 543cdafe7dca0cc7b22d76706b9b7f4017f1e85b
+commit = 0d475bf309af883db621ef159af150be1087a222
 path   = acadsharp/tests

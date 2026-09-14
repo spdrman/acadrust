@@ -22,61 +22,54 @@ and a crate's suite should not need one to go green.
 
 ## Where it stands
 
-43 fixtures, of which 36 carry a recording.
+52 fixtures, of which 46 carry a recording, read from libviprs-dep at the pinned commit.
 
-| Verdict | Count | Means |
-| --- | --- | --- |
-| `MATCH` | 15 | every geometry record agreed, to 1e-6 |
-| `DIFF:n` | 1 | same record count, n records disagreed |
-| `COUNT:a/b` | 1 | acadrust produced a records, ACadSharp b |
-| `UNCOMPARED` | 16 | the fixture needs flattening this harness does not do |
-| no recording | 7 | benchmark and limit fixtures with no expectation committed |
+| Verdict | Count |
+| --- | --- |
+| `MATCH` | 28 |
+| `DIFF` | 6 |
+| `COUNT` | 4 |
+| `UNCOMPARED` | 7 |
+| no recording | 6 |
 
-`g13_scale_1x` is the one to look at before believing the rest: 128 records,
-64 circles and 64 lines, every one of them matching to six decimal places.
+Block expansion is implemented here, and it was validated before being trusted: it
+reproduces `g13_insert` exactly, rotation and the `flags` bit included, against a
+recording made by the real ACadSharp. That bootstrap is what makes the expander usable on
+the fixtures whose answer is not already known.
 
 ## The two real differences
 
 **Extrusion normals are not normalized.** On `g13_ocs_plane` acadrust reports
 `normal=[(1.000000,2.000000,2.000000)]` where ACadSharp reports
-`normal=[(0.333333,0.666667,0.666667)]`, which is the same direction divided by
-its length. The centre of that circle agrees exactly, to every decimal place, so
-the arbitrary-axis maths underneath is right and it is the vector handed back
-that is raw. Anything treating the normal as a unit vector, which is what a
-normal usually is, gets a wrong answer scaled by 3.
+`normal=[(0.333333,0.666667,0.666667)]`, the same direction over its length. The circle's
+centre agrees to every decimal place, so the arbitrary-axis maths underneath is right and
+only the returned vector is raw. It shows up twice, on `g13_ocs_plane` and `g13_solid`.
 
-**Non-finite geometry passes straight through.** `g13_nan_bulge` holds a
-polyline with a NaN bulge and one with an Infinity. acadrust reads both and
-emits them. ACadSharp's adapter emits neither, and says why:
+**Non-finite geometry passes straight through.** `g13_nan_bulge` holds a polyline with a
+NaN bulge and one with an Infinity. acadrust reads and emits both; ACadSharp's adapter
+emits neither and says its wire contract promises finite values. A difference in contract
+rather than in parsing, and worth recording because a consumer porting off ACadSharp
+inherits the filtering job without being told.
 
-```
-Warning code=NON_FINITE_GEOMETRY message="Polyline value 13 is NaN, and
-docs/WIRE.md promises no geometry record carries a value that is not finite,
-so this entity is not emitted"
-```
+## What is this harness's own gap, not acadrust's
 
-That is a difference in contract rather than in parsing. The file really does
-contain NaN, and acadrust never promised to filter it. It is recorded here
-because a consumer porting off ACadSharp inherits the filtering job without
-being told, and NaN reaching a renderer is not a failure that announces itself.
+Seven fixtures, and they are listed rather than buried because a conformance report that
+cannot separate its own omissions from the thing it measures is worth nothing:
 
-## What is not compared, and why that matters
+- **No renderer yet**: `g13_leader`, `g13_mline`, `g13_wipeout`. ACadSharp lowers these
+  onto `Polyline` and `Polygon` records; this does not render them at all.
+- **Mirror handling**: `g13_mirrored_bulge`, `g13_ocs_mirror`, `g13_face3d`. A mirrored
+  insertion reverses what counter-clockwise means, so a bulge's sign, an arc's direction
+  and a face's winding all follow it. This applies the point transform and not that.
+- **OCS composed with an insertion**: `g13_ocs_rotated`. The normal has to follow the
+  transform rather than be copied off the entity.
 
-16 fixtures are `UNCOMPARED`. Every one of them holds an INSERT, a HATCH or a
-DIMENSION, and the recording lowers all three to primitives: a block is
-expanded and transformed, a hatch becomes its boundary polygons, a dimension
-becomes the contents of its dimension block.
+## What is not compared at all
 
-This harness does none of that, deliberately. Writing a second flattener here
-would mean every difference it found could be its own bug rather than
-acadrust's, and a conformance report that cannot tell those apart is worse than
-no report. So the fixtures that need one say so.
-
-That leaves the honest summary: **on the geometry this harness can compare,
-acadrust agrees with ACadSharp on 15 of 17 fixtures, and the two it does not
-agree on are both narrow and both understood.** Block expansion, hatch
-boundaries and dimension flattening are unmeasured, and they are the parts a
-CAD renderer leans on hardest.
+Seven `UNCOMPARED`: two dimension fixtures and three hatch files, where the recording
+expands a composite this harness does not; one non-uniform insertion of a curved
+primitive, where ACadSharp warns rather than distorting a circle and the two are not
+comparable by construction; and one unresolved xref.
 
 ## Why a baseline instead of asserting equality
 
