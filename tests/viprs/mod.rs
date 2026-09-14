@@ -23,6 +23,13 @@ fn p3(x: f64, y: f64, z: f64) -> String {
     format!("({:.6},{:.6},{:.6})", z6(x), z6(y), z6(z))
 }
 
+/// One scalar, with negative zero collapsed. A sign flip or a transform
+/// produces it readily and it formats as "-0.000000" against the recording's
+/// "0.000000".
+fn f6(v: f64) -> String {
+    format!("{:.6}", if v.abs() < 5e-7 { 0.0 } else { v })
+}
+
 fn v3(v: &acadrust::types::Vector3) -> String {
     p3(v.x, v.y, v.z)
 }
@@ -88,6 +95,35 @@ fn norm(v: [f64; 3]) -> [f64; 3] {
         v
     } else {
         [v[0] / l, v[1] / l, v[2] / l]
+    }
+}
+
+/// An in-plane angle carried through a transform.
+///
+/// The angle is measured in the plane the entity's normal defines, so the
+/// linear part alone cannot move it: the plane moves too. The direction at
+/// that angle is built in the old basis, carried across, and read back in the
+/// new one. Using only the transform's XY block, which is the obvious
+/// shortcut, is right for an entity in the world XY plane and nonsense for one
+/// that is not: it collapsed g13_ocs_rotated's arc onto a single angle.
+fn angle_through(at: &Xform, normal: &acadrust::types::Vector3, a: f64) -> f64 {
+    let o = Ocs::new(normal);
+    let (c, si) = (a.cos(), a.sin());
+    let d = (
+        o.ax[0] * c + o.ay[0] * si,
+        o.ax[1] * c + o.ay[1] * si,
+        o.ax[2] * c + o.ay[2] * si,
+    );
+    let d2 = at.direction(d);
+    let n2 = at.direction((normal.x, normal.y, normal.z));
+    let o2 = Ocs::new(&acadrust::types::Vector3::new(n2.0, n2.1, n2.2));
+    let x = d2.0 * o2.ax[0] + d2.1 * o2.ax[1] + d2.2 * o2.ax[2];
+    let y = d2.0 * o2.ay[0] + d2.1 * o2.ay[1] + d2.2 * o2.ay[2];
+    let r = y.atan2(x);
+    if r < -1e-12 {
+        r + std::f64::consts::TAU
+    } else {
+        r
     }
 }
 
@@ -182,8 +218,6 @@ impl Verdict {
 /// acadrust's defects.
 fn unrendered(e: &EntityType) -> Option<&'static str> {
     match e {
-        EntityType::Hatch(_) => Some("HATCH: the recording lowers a hatch to boundary polygons"),
-        EntityType::Dimension(_) => Some("DIMENSION: the recording expands the dimension block"),
         _ => None,
     }
 }
@@ -269,16 +303,14 @@ fn render(p: &Placed) -> Vec<Record> {
             // The face's own plane, the same way a MESH face carries one. A
             // 3DFACE lying in the world XY plane cannot tell this from world
             // Z, which is why g13_face3d holds one that does not.
-            let e1 = [
-                f.second_corner.x - f.first_corner.x,
-                f.second_corner.y - f.first_corner.y,
-                f.second_corner.z - f.first_corner.z,
-            ];
-            let e2 = [
-                f.third_corner.x - f.first_corner.x,
-                f.third_corner.y - f.first_corner.y,
-                f.third_corner.z - f.first_corner.z,
-            ];
+            let w1 =
+                p.at.point(f.first_corner.x, f.first_corner.y, f.first_corner.z);
+            let w2 =
+                p.at.point(f.second_corner.x, f.second_corner.y, f.second_corner.z);
+            let w3 =
+                p.at.point(f.third_corner.x, f.third_corner.y, f.third_corner.z);
+            let e1 = [w2.0 - w1.0, w2.1 - w1.1, w2.2 - w1.2];
+            let e2 = [w3.0 - w1.0, w3.1 - w1.1, w3.2 - w1.2];
             let n = norm(cross(e1, e2));
             let up = acadrust::types::Vector3::new(n[0], n[1], n[2]);
             quad_record(
@@ -343,6 +375,179 @@ fn render(p: &Placed) -> Vec<Record> {
                 })
                 .collect()
         }
+        // LEADER: the vertex run, and nothing else. The arrowhead is a glyph
+        // the dimension style names and is not in the drawing, which the
+        // recording says in an ARROWHEAD_NOT_DRAWN warning rather than by
+        // inventing one.
+        EntityType::Leader(l) => {
+            // A spline-fit leader's curve is not in the file as a curve, and
+            // the recording declines to tessellate it: a polyline through the
+            // fit points would be a tessellation by another name. So this
+            // declines too rather than inventing the same curve differently.
+            if matches!(l.path_type, acadrust::entities::LeaderPathType::Spline) {
+                return Vec::new();
+            }
+            let pts: Vec<String> = l
+                .vertices
+                .iter()
+                .map(|v| {
+                    let (x, y, z) = p.at.point(v.x, v.y, v.z);
+                    p3(x, y, z)
+                })
+                .collect();
+            if pts.len() < 2 {
+                return Vec::new();
+            }
+            let n = p.at.direction((l.normal.x, l.normal.y, l.normal.z));
+            let mut body = String::new();
+            if write!(
+                body,
+                "n={} closed=0 pts=[{}] bulges=[] normal=[{}]",
+                pts.len(),
+                pts.join(";"),
+                p3(n.0, n.1, n.2)
+            )
+            .is_err()
+            {
+                return Vec::new();
+            }
+            vec![Record {
+                kind: "Polyline".into(),
+                handle,
+                flags: p.from_block as u32,
+                body,
+            }]
+        }
+        // WIPEOUT: the clip boundary, as a closed polygon. The boundary is in
+        // the unit square of the image's own frame, so it is mapped through
+        // the insertion point and the u/v vectors rather than used directly.
+        EntityType::Wipeout(w) => {
+            let ip = &w.insertion_point;
+            let (u, v) = (&w.u_vector, &w.v_vector);
+            // The boundary is in the image's own frame, whose origin is the
+            // top left and whose V axis runs DOWN. So u takes c.x + 0.5 and v
+            // takes 0.5 - c.y, and reading v the same way as u mirrors every
+            // boundary about the frame's middle, which on a symmetric one
+            // looks entirely correct.
+            let map = |cx: f64, cy: f64| {
+                let (fu, fv) = (cx + 0.5, 0.5 - cy);
+                let x = ip.x + fu * u.x + fv * v.x;
+                let y = ip.y + fu * u.y + fv * v.y;
+                let z = ip.z + fu * u.z + fv * v.z;
+                p.at.point(x, y, z)
+            };
+            let cv = &w.clip_boundary_vertices;
+            let world: Vec<(f64, f64, f64)> = if cv.len() == 2 {
+                // A rectangular clip stores two opposite corners, not four.
+                let (a, b) = (&cv[0], &cv[1]);
+                vec![map(a.x, a.y), map(b.x, a.y), map(b.x, b.y), map(a.x, b.y)]
+            } else {
+                cv.iter().map(|c| map(c.x, c.y)).collect()
+            };
+            if world.len() < 3 {
+                return Vec::new();
+            }
+            let pts: Vec<String> = world.iter().map(|w| p3(w.0, w.1, w.2)).collect();
+            // The plane of the PLACED boundary, not the local frame's carried
+            // across. A normal does not transform by the linear part: under a
+            // reflection that gives the opposite sign, which is exactly the
+            // case a mirrored insertion produces.
+            let e1 = [
+                world[1].0 - world[0].0,
+                world[1].1 - world[0].1,
+                world[1].2 - world[0].2,
+            ];
+            let e2 = [
+                world[2].0 - world[0].0,
+                world[2].1 - world[0].1,
+                world[2].2 - world[0].2,
+            ];
+            let nn = norm(cross(e1, e2));
+            let n = (nn[0], nn[1], nn[2]);
+            let mut body = String::new();
+            if write!(
+                body,
+                "n={} closed=1 pts=[{}] bulges=[] normal=[{}]",
+                pts.len(),
+                pts.join(";"),
+                p3(n.0, n.1, n.2)
+            )
+            .is_err()
+            {
+                return Vec::new();
+            }
+            vec![Record {
+                kind: "Polygon".into(),
+                handle,
+                flags: p.from_block as u32,
+                body,
+            }]
+        }
+        // HATCH lowers to its boundary loops. A loop made only of straight
+        // edges is a closed polygon and becomes one record; a loop carrying a
+        // curve cannot be expressed that way, and the recording says so in a
+        // HATCH_LOOP_NOT_POLYGON warning and lets the edges follow as records
+        // of their own. A hatch with no loop at all is pattern only and draws
+        // nothing.
+        EntityType::Hatch(hx) => {
+            let o = Ocs::new(&hx.normal);
+            let mut out = Vec::new();
+            for path in &hx.paths {
+                let straight = path.edges.iter().all(|e| {
+                    matches!(
+                        e,
+                        acadrust::entities::BoundaryEdge::Line(_)
+                            | acadrust::entities::BoundaryEdge::Polyline(_)
+                    )
+                });
+                if !straight || path.edges.is_empty() {
+                    // Its edges follow as their own records. This harness does
+                    // not synthesise those, so the fixture reports a count
+                    // difference rather than a silently short polygon.
+                    continue;
+                }
+                let mut world: Vec<(f64, f64, f64)> = Vec::new();
+                for e in &path.edges {
+                    match e {
+                        acadrust::entities::BoundaryEdge::Line(l) => {
+                            let (x, y, z) = o.to_world(l.start.x, l.start.y, hx.elevation);
+                            world.push(p.at.point(x, y, z));
+                        }
+                        acadrust::entities::BoundaryEdge::Polyline(pv) => {
+                            for v in &pv.vertices {
+                                let (x, y, z) = o.to_world(v.x, v.y, hx.elevation);
+                                world.push(p.at.point(x, y, z));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if world.len() < 3 {
+                    continue;
+                }
+                let pts: Vec<String> = world.iter().map(|w| p3(w.0, w.1, w.2)).collect();
+                let n = p.at.direction((hx.normal.x, hx.normal.y, hx.normal.z));
+                let mut body = String::new();
+                if write!(
+                    body,
+                    "n={} closed=1 pts=[{}] bulges=[] normal=[{}]",
+                    pts.len(),
+                    pts.join(";"),
+                    p3(n.0, n.1, n.2)
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                out.push(Record {
+                    kind: "Polygon".into(),
+                    handle: handle.clone(),
+                    flags: p.from_block as u32,
+                    body,
+                });
+            }
+            out
+        }
         _ => render_one(p).into_iter().collect(),
     }
 }
@@ -360,55 +565,77 @@ fn render_one(p: &Placed) -> Option<Record> {
             "Line"
         }
         EntityType::Circle(c) => {
-            // A circle under a non-uniform transform is an ellipse, and the
-            // recording emits a NonUniform warning rather than a distorted
-            // circle. Comparing here would report that disagreement as a
-            // geometry difference, which it is not.
-            if !at.uniform() {
-                return None;
-            }
+            // A non-uniform transform earns a NON_UNIFORM_BLOCK_SCALE warning
+            // over there AND the record is still emitted, with the radius
+            // taking the x scale. So this emits it too rather than declining.
             let o = Ocs::new(&c.normal);
             let (x, y, z) = o.to_world(c.center.x, c.center.y, c.center.z);
             let (x, y, z) = at.point(x, y, z);
+            let n = at.direction((c.normal.x, c.normal.y, c.normal.z));
             write!(
                 body,
-                "c=[{}] r={:.6} normal=[{}]",
+                "c=[{}] r={:.6} normal=[({:.6},{:.6},{:.6})]",
                 p3(x, y, z),
                 c.radius * at.scale_hint(),
-                v3(&c.normal)
+                n.0,
+                n.1,
+                n.2
             )
             .ok()?;
             "Circle"
         }
         EntityType::Arc(a) => {
-            if !at.uniform() {
-                return None;
-            }
             let o = Ocs::new(&a.normal);
             let (x, y, z) = o.to_world(a.center.x, a.center.y, a.center.z);
             let (x, y, z) = at.point(x, y, z);
+            // A reflection reverses the sweep, so the transformed endpoints
+            // change places as well as moving.
+            let (mut b0, mut b1) = (
+                angle_through(at, &a.normal, a.start_angle),
+                angle_through(at, &a.normal, a.end_angle),
+            );
+            if at.mirrored() {
+                std::mem::swap(&mut b0, &mut b1);
+            }
+            let n = at.direction((a.normal.x, a.normal.y, a.normal.z));
             write!(
                 body,
-                "c=[{}] r={:.6} a0={:.6} a1={:.6} normal=[{}]",
+                "c=[{}] r={:.6} a0={:.6} a1={:.6} normal=[({:.6},{:.6},{:.6})]",
                 p3(x, y, z),
                 a.radius * at.scale_hint(),
-                a.start_angle,
-                a.end_angle,
-                v3(&a.normal)
+                b0,
+                b1,
+                n.0,
+                n.1,
+                n.2
             )
             .ok()?;
             "Arc"
         }
         EntityType::Ellipse(el) => {
+            // An ellipse's centre and major axis are world coordinates, so
+            // neither takes an OCS lift; the axis is a displacement and keeps
+            // its length through the linear part. A reflection reverses the
+            // parameter sweep, so the two parameters change places and sign,
+            // and they are NOT wrapped into [0, tau): the recording prints the
+            // negative.
+            let c = at.point(el.center.x, el.center.y, el.center.z);
+            let maj = at.linear((el.major_axis.x, el.major_axis.y, el.major_axis.z));
+            let n = at.direction((el.normal.x, el.normal.y, el.normal.z));
+            let (p0, p1) = if at.mirrored() {
+                (-el.end_parameter, -el.start_parameter)
+            } else {
+                (el.start_parameter, el.end_parameter)
+            };
             write!(
                 body,
-                "c=[{}] major=[{}] ratio={:.6} p0={:.6} p1={:.6} normal=[{}]",
-                v3(&el.center),
-                v3(&el.major_axis),
-                el.minor_axis_ratio,
-                el.start_parameter,
-                el.end_parameter,
-                v3(&el.normal)
+                "c=[{}] major=[{}] ratio={} p0={} p1={} normal=[{}]",
+                p3(c.0, c.1, c.2),
+                p3(maj.0, maj.1, maj.2),
+                f6(el.minor_axis_ratio),
+                f6(p0),
+                f6(p1),
+                p3(n.0, n.1, n.2)
             )
             .ok()?;
             "Ellipse"
@@ -424,11 +651,8 @@ fn render_one(p: &Placed) -> Option<Record> {
                     p3(x, y, z)
                 })
                 .collect();
-            let bulges: Vec<String> = pl
-                .vertices
-                .iter()
-                .map(|v| format!("{:.6}", v.bulge))
-                .collect();
+            let flip = if at.mirrored() { -1.0 } else { 1.0 };
+            let bulges: Vec<String> = pl.vertices.iter().map(|v| f6(v.bulge * flip)).collect();
             let any = bulges.iter().any(|b| b != "0.000000");
             write!(
                 body,
@@ -437,7 +661,10 @@ fn render_one(p: &Placed) -> Option<Record> {
                 pl.is_closed as u8,
                 pts.join(";"),
                 if any { bulges.join(",") } else { String::new() },
-                v3(&pl.normal)
+                {
+                    let n = at.direction((pl.normal.x, pl.normal.y, pl.normal.z));
+                    p3(n.0, n.1, n.2)
+                }
             )
             .ok()?;
             "Polyline"
@@ -462,9 +689,9 @@ fn render_one(p: &Placed) -> Option<Record> {
             "Text"
         }
         EntityType::Spline(s) => {
-            let knots: Vec<String> = s.knots.iter().map(|k| format!("{:.6}", k)).collect();
+            let knots: Vec<String> = s.knots.iter().map(|k| f6(*k)).collect();
             let ctrl: Vec<String> = s.control_points.iter().map(v3).collect();
-            let weights: Vec<String> = s.weights.iter().map(|w| format!("{:.6}", w)).collect();
+            let weights: Vec<String> = s.weights.iter().map(|w| f6(*w)).collect();
             // acadrust holds these as five bools; the recording prints the DXF
             // bitmask (70), so rebuild it rather than invent a spelling.
             let f = &s.flags;
@@ -515,15 +742,15 @@ fn render_one(p: &Placed) -> Option<Record> {
                 .vertices
                 .iter()
                 .map(|v| {
-                    let (x, y, z) = o.to_world(v.location.x, v.location.y, p2.elevation);
+                    // The vertex's own third coordinate, not the polyline's
+                    // elevation. g13_ocs_plane holds one of each at elevation
+                    // 2: the LwPolyline's points land at z -2 and this one's
+                    // at 0, so the two fields are not interchangeable.
+                    let (x, y, z) = o.to_world(v.location.x, v.location.y, v.location.z);
                     p3(x, y, z)
                 })
                 .collect();
-            let bulges: Vec<String> = p2
-                .vertices
-                .iter()
-                .map(|v| format!("{:.6}", v.bulge))
-                .collect();
+            let bulges: Vec<String> = p2.vertices.iter().map(|v| f6(v.bulge)).collect();
             let any = bulges.iter().any(|b| b != "0.000000");
             write!(
                 body,
@@ -584,20 +811,38 @@ impl Xform {
     }
 
     /// The transform one insertion contributes: scale, then rotate about Z,
-    /// then translate to the insertion point. That order is the one DXF
-    /// defines, and swapping the first two is the classic way to get a
+    /// then place the result in the plane the insertion's own extrusion
+    /// defines, then translate to the insertion point. That order is the one
+    /// DXF defines, and swapping the first two is the classic way to get a
     /// mirrored insert subtly wrong.
+    ///
+    /// The extrusion is the part that is easy to miss, because it is the
+    /// identity on every insertion that sits in the world XY plane, which is
+    /// most of them. An INSERT carries its own normal, its insertion point is
+    /// measured in the plane that normal defines, and so is the block content
+    /// it places. Ignoring it puts g13_ocs_rotated's circle at +3 instead of
+    /// -3 and leaves its plane reading as the world's.
     fn of_insert(i: &acadrust::entities::Insert) -> Self {
         let (c, s) = (i.rotation.cos(), i.rotation.sin());
         let (sx, sy, sz) = (i.x_scale(), i.y_scale(), i.z_scale());
-        Xform {
+        let local = Xform {
             m: [
                 [c * sx, -s * sy, 0.0],
                 [s * sx, c * sy, 0.0],
                 [0.0, 0.0, sz],
             ],
             t: [i.insert_point.x, i.insert_point.y, i.insert_point.z],
-        }
+        };
+        let o = Ocs::new(&i.normal);
+        let basis = Xform {
+            m: [
+                [o.ax[0], o.ay[0], o.az[0]],
+                [o.ax[1], o.ay[1], o.az[1]],
+                [o.ax[2], o.ay[2], o.az[2]],
+            ],
+            t: [0.0, 0.0, 0.0],
+        };
+        basis.then(local)
     }
 
     fn then(self, inner: Xform) -> Self {
@@ -633,6 +878,54 @@ impl Xform {
 
     fn scale_hint(&self) -> f64 {
         (self.m[0][0].powi(2) + self.m[1][0].powi(2)).sqrt()
+    }
+
+    /// Negative when the transform reflects. A reflection reverses what
+    /// counter-clockwise means, which is what decides a bulge's sign, an arc's
+    /// direction and a face's winding.
+    fn mirrored(&self) -> bool {
+        let m = &self.m;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        det < 0.0
+    }
+
+    /// A direction through the linear part, renormalised. The record's normal
+    /// is the plane its angles and bulges are measured in, so it has to follow
+    /// the transform rather than be copied off the entity.
+    fn direction(&self, v: (f64, f64, f64)) -> (f64, f64, f64) {
+        let n = norm([
+            self.m[0][0] * v.0 + self.m[0][1] * v.1 + self.m[0][2] * v.2,
+            self.m[1][0] * v.0 + self.m[1][1] * v.1 + self.m[1][2] * v.2,
+            self.m[2][0] * v.0 + self.m[2][1] * v.1 + self.m[2][2] * v.2,
+        ]);
+        (n[0], n[1], n[2])
+    }
+
+    /// Where an in-plane angle ends up. The point at that angle on the unit
+    /// circle is carried through the linear part and read back as an angle,
+    /// which handles rotation and reflection without either being special.
+    fn angle(&self, a: f64) -> f64 {
+        let (x, y) = (a.cos(), a.sin());
+        let tx = self.m[0][0] * x + self.m[0][1] * y;
+        let ty = self.m[1][0] * x + self.m[1][1] * y;
+        let r = ty.atan2(tx);
+        if r < 0.0 {
+            r + std::f64::consts::TAU
+        } else {
+            r
+        }
+    }
+
+    /// A vector through the linear part only, keeping its length. A major
+    /// axis is a displacement rather than a direction, so it scales.
+    fn linear(&self, v: (f64, f64, f64)) -> (f64, f64, f64) {
+        (
+            self.m[0][0] * v.0 + self.m[0][1] * v.1 + self.m[0][2] * v.2,
+            self.m[1][0] * v.0 + self.m[1][1] * v.1 + self.m[1][2] * v.2,
+            self.m[2][0] * v.0 + self.m[2][1] * v.1 + self.m[2][2] * v.2,
+        )
     }
 
     fn is_identity(&self) -> bool {
@@ -672,14 +965,42 @@ pub fn expand(doc: &acadrust::document::CadDocument) -> Result<Vec<Placed<'_>>, 
             return Err("block nesting deeper than 16".into());
         }
         match e {
+            // A DIMENSION is a composite whose drawn geometry lives in an
+            // anonymous block, with its own insertion scale and rotation. So
+            // it expands exactly the way an INSERT does rather than needing a
+            // second mechanism, and its contents carry the block flag for the
+            // same reason.
+            EntityType::Dimension(d) => {
+                let local = Xform {
+                    m: [
+                        [
+                            d.base().insertion_rotation.cos() * d.base().insertion_scale.x,
+                            -d.base().insertion_rotation.sin() * d.base().insertion_scale.y,
+                            0.0,
+                        ],
+                        [
+                            d.base().insertion_rotation.sin() * d.base().insertion_scale.x,
+                            d.base().insertion_rotation.cos() * d.base().insertion_scale.y,
+                            0.0,
+                        ],
+                        [0.0, 0.0, d.base().insertion_scale.z],
+                    ],
+                    t: [0.0, 0.0, 0.0],
+                };
+                let inner = at.then(local);
+                let members: Vec<&EntityType> =
+                    doc.entities_in_block(&d.base().block_name).collect();
+                for m in members.into_iter().rev() {
+                    stack.push((m, inner, true, depth + 1));
+                }
+            }
             EntityType::Insert(i) => {
                 let inner = at.then(Xform::of_insert(i));
                 let members: Vec<&EntityType> = doc.entities_in_block(&i.block_name).collect();
-                if members.is_empty() {
-                    // An unresolved block, an xref most likely. The recording
-                    // has its own answer for those and it is not geometry.
-                    return Err(format!("block `{}` resolves to nothing", i.block_name));
-                }
+                // An unresolved block, an xref most likely. The recording
+                // answers with an UNRESOLVED_BLOCK warning and no geometry, so
+                // contributing nothing here is agreeing with it, not skipping.
+
                 for m in members.into_iter().rev() {
                     stack.push((m, inner, true, depth + 1));
                 }
@@ -712,19 +1033,26 @@ pub fn dump_fixture(dwg: &Path, expectation: &Path) -> Verdict {
         if let Some(why) = unrendered(p.entity) {
             return Verdict::Uncompared(why.to_string());
         }
-        // A non-uniform transform over a curved primitive is a disagreement
-        // about representation rather than about geometry: the recording warns
-        // instead of emitting a distorted circle. Skipping the whole fixture
-        // keeps that out of the record counts.
-        if !p.at.uniform()
-            && matches!(
-                p.entity,
-                EntityType::Circle(_) | EntityType::Arc(_) | EntityType::Ellipse(_)
-            )
-        {
-            return Verdict::Uncompared(
-                "a curved primitive under a non-uniform insertion; the recording warns rather than distorting it".into(),
-            );
+        // A hatch loop carrying a curve is emitted over there as a warning
+        // plus the loop's edges as records of their own. This harness does not
+        // synthesise those, and emitting the straight loops alone would report
+        // its own omission as a count difference against acadrust.
+        if let EntityType::Hatch(hx) = p.entity {
+            if hx.paths.iter().any(|path| {
+                path.edges.is_empty()
+                    || !path.edges.iter().all(|e| {
+                        matches!(
+                            e,
+                            acadrust::entities::BoundaryEdge::Line(_)
+                                | acadrust::entities::BoundaryEdge::Polyline(_)
+                        )
+                    })
+            }) {
+                return Verdict::Uncompared(
+                    "a hatch loop carries a curve; the recording emits its edges as records and this does not"
+                        .into(),
+                );
+            }
         }
     }
 

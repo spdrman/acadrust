@@ -26,50 +26,50 @@ and a crate's suite should not need one to go green.
 
 | Verdict | Count |
 | --- | --- |
-| `MATCH` | 28 |
-| `DIFF` | 6 |
-| `COUNT` | 4 |
-| `UNCOMPARED` | 7 |
+| `MATCH` | 39 |
+| `DIFF` | 1 |
+| `COUNT` | 3 |
+| `UNCOMPARED` | 1 |
 | no recording | 6 |
 
-Block expansion is implemented here, and it was validated before being trusted: it
-reproduces `g13_insert` exactly, rotation and the `flags` bit included, against a
-recording made by the real ACadSharp. That bootstrap is what makes the expander usable on
-the fixtures whose answer is not already known.
+The harness models the DWG format's own semantics: the arbitrary axis algorithm, block
+expansion including an insertion's own extrusion, reflection, non-uniform scale, and
+dimension blocks. It was bootstrapped rather than trusted: block expansion reproduces
+`g13_insert` exactly, rotation and the `flags` bit included, against a recording made by
+the real ACadSharp.
 
 ## The two real differences
 
-**Extrusion normals are not normalized.** On `g13_ocs_plane` acadrust reports
-`normal=[(1.000000,2.000000,2.000000)]` where ACadSharp reports
-`normal=[(0.333333,0.666667,0.666667)]`, the same direction over its length. The circle's
-centre agrees to every decimal place, so the arbitrary-axis maths underneath is right and
-only the returned vector is raw. It shows up twice, on `g13_ocs_plane` and `g13_solid`.
+**Extrusion normals are not normalized.** acadrust returns `(1,2,2)` where ACadSharp
+returns `(0.333,0.667,0.667)`, the same direction over its length. Every coordinate beside
+it agrees to six decimals, so the arbitrary-axis maths underneath is right and only the
+returned vector is raw. Visible on `g13_solid`.
 
-**Non-finite geometry passes straight through.** `g13_nan_bulge` holds a polyline with a
-NaN bulge and one with an Infinity. acadrust reads and emits both; ACadSharp's adapter
-emits neither and says its wire contract promises finite values. A difference in contract
-rather than in parsing, and worth recording because a consumer porting off ACadSharp
-inherits the filtering job without being told.
+**Non-finite geometry passes straight through.** `g13_nan_bulge` holds a NaN bulge and an
+Infinity. acadrust emits both; ACadSharp's adapter emits neither, because its wire contract
+promises finite values. A difference in contract rather than in parsing, and worth
+recording because a consumer porting off ACadSharp inherits the filtering job without being
+told.
 
-## What is this harness's own gap, not acadrust's
+## Where the harness deliberately stops
 
-Seven fixtures, and they are listed rather than buried because a conformance report that
-cannot separate its own omissions from the thing it measures is worth nothing:
+Two lowerings are the adapter's product decisions rather than the format's semantics, and
+this harness does not reimplement them:
 
-- **No renderer yet**: `g13_leader`, `g13_mline`, `g13_wipeout`. ACadSharp lowers these
-  onto `Polyline` and `Polygon` records; this does not render them at all.
-- **Mirror handling**: `g13_mirrored_bulge`, `g13_ocs_mirror`, `g13_face3d`. A mirrored
-  insertion reverses what counter-clockwise means, so a bulge's sign, an arc's direction
-  and a face's winding all follow it. This applies the point transform and not that.
-- **OCS composed with an insertion**: `g13_ocs_rotated`. The normal has to follow the
-  transform rather than be copied off the entity.
+- **MLINE** (`g13_mline`, 0 of 21 records). The offsets live in a style table, and the
+  joints are mitred. How to mitre is a choice, not a fact about the file.
+- **A hatch loop carrying a curve** (`g13_hatch`). ACadSharp emits a warning and then the
+  loop's edges as records of their own. Which curve becomes which record is likewise a
+  choice. Straight-edged loops ARE compared, and match.
 
-## What is not compared at all
+That line is the whole reason this report is worth reading. Past it the harness would be a
+second implementation of the thing it is measuring, and every difference it found could be
+its own. Where it cannot express a fixture it says `UNCOMPARED` rather than emitting fewer
+records, because a short count reads as the other side's defect.
 
-Seven `UNCOMPARED`: two dimension fixtures and three hatch files, where the recording
-expands a composite this harness does not; one non-uniform insertion of a curved
-primitive, where ACadSharp warns rather than distorting a circle and the two are not
-comparable by construction; and one unresolved xref.
+`real_AC1018` and `real_AC1032` sit at 318 of 380 records for the same reason. They are
+measured rather than skipped, and the 62-record gap is not yet attributed between those two
+lowerings and anything else.
 
 ## Why a baseline instead of asserting equality
 
