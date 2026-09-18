@@ -283,8 +283,37 @@ fn quad_record(
 
 /// Every record one placed entity lowers to. A MESH is one Polygon per face,
 /// so this is a list rather than an option.
-fn render(p: &Placed) -> Vec<Record> {
+fn render(doc: &acadrust::document::CadDocument, p: &Placed) -> Vec<Record> {
+    // An ATTRIB reached through its insertion rather than through the
+    // document. It is not an `EntityType` anywhere a reference can be taken
+    // from — the DWG reader hangs it off the INSERT and puts nothing in the
+    // entity table — so it travels beside the entity and is answered here,
+    // before the entity's own kind is looked at.
+    if let Some(a) = p.attribute {
+        let mut body = String::new();
+        if text_body(
+            &mut body,
+            &p.at,
+            &a.normal,
+            &a.insertion_point,
+            a.height,
+            a.rotation,
+            &a.value,
+        )
+        .is_none()
+        {
+            return Vec::new();
+        }
+        return vec![Record {
+            kind: "Text".into(),
+            handle: format!("{:X}", a.common.handle.value()),
+            flags: u32::from(p.from_block),
+            body,
+        }];
+    }
+
     let handle = format!("{:X}", p.entity.common().handle.value());
+    let at = &p.at;
     match p.entity {
         EntityType::Solid(sd) => quad_record(
             p,
@@ -548,8 +577,209 @@ fn render(p: &Placed) -> Vec<Record> {
             }
             out
         }
+        // MLINE, which is a path plus a style and lowers to one Polyline per
+        // element of that style. This is the one lowering here that needs a
+        // lookup, and the reason it is done rather than declined is that the
+        // lookup's target is in the file: the style's element offsets, the
+        // justification, the scale factor, and per vertex the position, the
+        // segment direction and the joint's miter bisector.
+        //
+        // The formula is the reference implementation's, which took it from
+        // the ODA specification and checked it two independent ways against
+        // the same real_AC1032 in this corpus
+        // (`native/Adapter/Flatten.MLine.cs`):
+        //
+        //     reference = 0 | max(offsets) | min(offsets)   by justification
+        //     effective = (offset - reference) * scale_factor
+        //     per vertex: D = unit(direction), M = unit(miter),
+        //                 N = unit(normal x D), t = effective / dot(M, N),
+        //                 point = position + M * t
+        //
+        // Dividing by dot(M, N) is what makes a bend meet itself: at a joint
+        // the miter is longer than the offset by the secant of half the turn,
+        // and offsetting each segment along its own perpendicular instead
+        // leaves a gap at every corner. The vertices are world coordinates
+        // already, so they are not lifted through the entity's plane; the
+        // record still names that plane, the way a Polyline3D does.
+        //
+        // Emitting the centre path alone would be the defect the reference
+        // implementation's comment names: a Polyline record with a plausible
+        // point count, real coordinates, and no field saying it is the half
+        // that did not need the lookup. So either every element crosses or
+        // none does.
+        EntityType::MLine(m) => {
+            let offsets = mline_offsets(doc, m);
+            if offsets.is_empty() || m.vertices.len() < 2 {
+                // What the recording answers with is a warning, and this
+                // harness compares geometry only, so no record is agreement.
+                return Vec::new();
+            }
+            let reference = match m.justification {
+                acadrust::entities::MLineJustification::Zero => 0.0,
+                acadrust::entities::MLineJustification::Top => {
+                    offsets.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+                }
+                acadrust::entities::MLineJustification::Bottom => {
+                    offsets.iter().copied().fold(f64::INFINITY, f64::min)
+                }
+            };
+            let normal = norm([m.normal.x, m.normal.y, m.normal.z]);
+            // One denominator per vertex, measured once rather than once per
+            // element, and all of them before anything is emitted: a vertex
+            // no element can be placed at refuses the whole entity rather
+            // than half of it, which is what the recording does.
+            let mut denominators = Vec::with_capacity(m.vertices.len());
+            for v in &m.vertices {
+                let d = norm([v.direction.x, v.direction.y, v.direction.z]);
+                let side = norm(cross(normal, d));
+                let miter = norm([v.miter.x, v.miter.y, v.miter.z]);
+                let denom = miter[0] * side[0] + miter[1] * side[1] + miter[2] * side[2];
+                if denom.abs() < 1e-12 {
+                    return Vec::new();
+                }
+                denominators.push(denom);
+            }
+            let closed = m.flags.contains(acadrust::entities::MLineFlags::CLOSED);
+            let n = at.direction((m.normal.x, m.normal.y, m.normal.z));
+            let mut out = Vec::with_capacity(offsets.len());
+            for offset in &offsets {
+                let effective = (offset - reference) * m.scale_factor;
+                let pts: Vec<String> = m
+                    .vertices
+                    .iter()
+                    .zip(&denominators)
+                    .map(|(v, denom)| {
+                        let miter = norm([v.miter.x, v.miter.y, v.miter.z]);
+                        let t = effective / denom;
+                        let (x, y, z) = at.point(
+                            v.position.x + miter[0] * t,
+                            v.position.y + miter[1] * t,
+                            v.position.z + miter[2] * t,
+                        );
+                        p3(x, y, z)
+                    })
+                    .collect();
+                let mut body = String::new();
+                if write!(
+                    body,
+                    "n={} closed={} pts=[{}] bulges=[] normal=[{}]",
+                    pts.len(),
+                    closed as u8,
+                    pts.join(";"),
+                    p3(n.0, n.1, n.2)
+                )
+                .is_err()
+                {
+                    return Vec::new();
+                }
+                // Every element under the entity's own handle, which is the
+                // MESH precedent: several records for one entity, consecutive.
+                out.push(Record {
+                    kind: "Polyline".into(),
+                    handle: handle.clone(),
+                    flags: u32::from(p.from_block),
+                    body,
+                });
+            }
+            out
+        }
         _ => render_one(p).into_iter().collect(),
     }
+}
+
+/// An MLINE's element offsets, in style order.
+///
+/// The handle is the one the entity holds; the name is the fallback, because a
+/// DXF-sourced document carries the style by name where a DWG carries it by
+/// handle. An empty answer is "no offsets", which the caller turns into no
+/// records rather than into the centre path.
+fn mline_offsets(doc: &acadrust::document::CadDocument, m: &acadrust::entities::MLine) -> Vec<f64> {
+    let by_handle = m.style_handle.and_then(|h| match doc.objects.get(&h) {
+        Some(acadrust::objects::ObjectType::MLineStyle(s)) => Some(s),
+        _ => None,
+    });
+    let style = by_handle.or_else(|| {
+        doc.objects.values().find_map(|o| match o {
+            acadrust::objects::ObjectType::MLineStyle(s) if s.name == m.style_name => Some(s),
+            _ => None,
+        })
+    });
+    style.map_or_else(Vec::new, |s| s.elements.iter().map(|e| e.offset).collect())
+}
+
+/// Record 10's body, shared by the four kinds that lower to it.
+///
+/// TEXT, MTEXT, ATTRIB and ATTDEF all cross as one Text record, and over
+/// there they come out of one arm rather than four: ATTRIB and ATTDEF derive
+/// from TextEntity, and MTEXT sits beside it writing the same three fields
+/// (`native/Adapter/Flattener.cs:1088-1134`). One body here keeps the four
+/// from drifting apart a field at a time.
+///
+/// The insertion point is lifted out of the plane the normal names, the way an
+/// arc's centre is. The rotation is NOT carried through the transform, which
+/// looks like an omission and is not: record 10 has no normal slot, so there
+/// is nowhere to tell a consumer which plane the angle is measured in, and the
+/// recording emits the in-plane angle for the same reason.
+fn text_body(
+    body: &mut String,
+    at: &Xform,
+    normal: &acadrust::types::Vector3,
+    insertion_point: &acadrust::types::Vector3,
+    height: f64,
+    rotation: f64,
+    value: &str,
+) -> Option<()> {
+    let o = Ocs::new(normal);
+    let (x, y, z) = o.to_world(insertion_point.x, insertion_point.y, insertion_point.z);
+    let (x, y, z) = at.point(x, y, z);
+    write!(
+        body,
+        "p=[{}] h={:.6} rot={:.6} value={}",
+        p3(x, y, z),
+        height * at.scale_hint(),
+        rotation,
+        quote(value)
+    )
+    .ok()
+}
+
+/// A string the way the dump writes one.
+///
+/// The rule is not ours and is not a choice: it is `Q` in libviprs-dep's
+/// `tests/fixtures/gen/CanonicalDump.cs:52`, and every dump on disk was
+/// written through it. Quote, backslash, tab, CR and LF are escaped, a
+/// control character below 0x20 becomes `\uXXXX` in lowercase hex, and
+/// everything else crosses verbatim, so a drawing's own UTF-8 stays UTF-8.
+///
+/// Printing the value raw instead reads as a match on plain ASCII and falls
+/// apart on the rest: real_AC1018's multi-line MTEXT broke its own record in
+/// two, which the comparison then read as a missing record and an unexpected
+/// one rather than as a text difference.
+///
+/// There is a sibling `Quote` in that repository's `Harness.cs` that also
+/// escapes everything above 0x7E, and it is the WRONG one to copy: it writes
+/// the scenario captures, not the record dumps. g11_codepage is what says so,
+/// because its recorded value is `ÄÖÜ-O-??` rather than six escapes.
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Below 0x20 is one UTF-16 unit either way, so the C# `x4` of a
+            // char and this are the same four digits.
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn render_one(p: &Placed) -> Option<Record> {
@@ -670,22 +900,47 @@ fn render_one(p: &Placed) -> Option<Record> {
             "Polyline"
         }
         EntityType::Text(t) => {
-            let o = Ocs::new(&t.normal);
-            let (x, y, z) = o.to_world(
-                t.insertion_point.x,
-                t.insertion_point.y,
-                t.insertion_point.z,
-            );
-            let (x, y, z) = at.point(x, y, z);
-            write!(
-                body,
-                "p=[{}] h={:.6} rot={:.6} value=\"{}\"",
-                p3(x, y, z),
-                t.height * at.scale_hint(),
+            text_body(
+                &mut body,
+                at,
+                &t.normal,
+                &t.insertion_point,
+                t.height,
                 t.rotation,
-                t.value
-            )
-            .ok()?;
+                &t.value,
+            )?;
+            "Text"
+        }
+        // ATTRIB and ATTDEF both derive from TextEntity in ACadSharp, so the
+        // reference implementation's text arm carries them rather than
+        // needing one of their own (`native/Adapter/Flattener.cs:1106`), and
+        // they cross as record 10 like any other text. The string is the one
+        // the drawing shows: an instance's value, a definition's default.
+        //
+        // Nine of real_AC1018's Text records are ATTDEFs, and they were the
+        // whole of that fixture's Text gap that was not the table below.
+        EntityType::AttributeEntity(a) => {
+            text_body(
+                &mut body,
+                at,
+                &a.normal,
+                &a.insertion_point,
+                a.height,
+                a.rotation,
+                &a.value,
+            )?;
+            "Text"
+        }
+        EntityType::AttributeDefinition(a) => {
+            text_body(
+                &mut body,
+                at,
+                &a.normal,
+                &a.insertion_point,
+                a.height,
+                a.rotation,
+                &a.default_value,
+            )?;
             "Text"
         }
         EntityType::Spline(s) => {
@@ -716,22 +971,15 @@ fn render_one(p: &Placed) -> Option<Record> {
         // no multi-line record, and the adapter emits the insertion point,
         // height and rotation the same way it does for TEXT.
         EntityType::MText(t) => {
-            let o = Ocs::new(&t.normal);
-            let (x, y, z) = o.to_world(
-                t.insertion_point.x,
-                t.insertion_point.y,
-                t.insertion_point.z,
-            );
-            let (x, y, z) = at.point(x, y, z);
-            write!(
-                body,
-                "p=[{}] h={:.6} rot={:.6} value=\"{}\"",
-                p3(x, y, z),
-                t.height * at.scale_hint(),
+            text_body(
+                &mut body,
+                at,
+                &t.normal,
+                &t.insertion_point,
+                t.height,
                 t.rotation,
-                t.value
-            )
-            .ok()?;
+                &t.value,
+            )?;
             "Text"
         }
         // A heavy 2D polyline. Its vertices carry a full Vector3 but only x
@@ -845,6 +1093,52 @@ impl Xform {
         basis.then(local)
     }
 
+    /// The transform a TABLE contributes to the block it caches.
+    ///
+    /// A TABLE is an INSERT over there: `TableEntity` derives from `Insert`
+    /// and the flattener dispatches on that base type
+    /// (`native/Adapter/Flattener.cs:514`), so a table's drawn cell borders
+    /// and cell text arrive out of the anonymous block at DXF 343 with the
+    /// block-provenance flag set. acadrust models a TABLE as its own entity
+    /// carrying the rows and the styles, so the placement an INSERT gets for
+    /// free has to be built here.
+    ///
+    /// Rotation is not a field on it. DXF 11 is the horizontal direction
+    /// vector, and the angle that makes in the plane the normal names is what
+    /// an INSERT spells as its rotation. There is no scale: a table's cache is
+    /// written in the coordinates the table is drawn at.
+    fn of_table(t: &acadrust::entities::Table) -> Self {
+        let o = Ocs::new(&t.normal);
+        let h = &t.horizontal_direction;
+        let dx = h.x * o.ax[0] + h.y * o.ax[1] + h.z * o.ax[2];
+        let dy = h.x * o.ay[0] + h.y * o.ay[1] + h.z * o.ay[2];
+        let len = (dx * dx + dy * dy).sqrt();
+        // A zero horizontal direction is a table nothing said the rotation
+        // of, which is the unrotated case rather than a malformed one.
+        let (c, s) = if len < 1e-12 {
+            (1.0, 0.0)
+        } else {
+            (dx / len, dy / len)
+        };
+        let local = Xform {
+            m: [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            t: [
+                t.insertion_point.x,
+                t.insertion_point.y,
+                t.insertion_point.z,
+            ],
+        };
+        let basis = Xform {
+            m: [
+                [o.ax[0], o.ay[0], o.az[0]],
+                [o.ax[1], o.ay[1], o.az[1]],
+                [o.ax[2], o.ay[2], o.az[2]],
+            ],
+            t: [0.0, 0.0, 0.0],
+        };
+        basis.then(local)
+    }
+
     fn then(self, inner: Xform) -> Self {
         let mut m = [[0.0; 3]; 3];
         for r in 0..3 {
@@ -943,6 +1237,15 @@ impl Xform {
 /// stripped once expansion exists.
 pub struct Placed<'a> {
     pub entity: &'a EntityType,
+    /// Set when what is placed is an ATTRIB the insertion carries rather than
+    /// the entity itself, in which case `entity` is the INSERT it came off.
+    ///
+    /// It needs a channel of its own because the DWG reader hands an ATTRIB
+    /// back inside `Insert::attributes` and puts nothing in the entity table,
+    /// so there is no `&EntityType` to point at. The reference implementation
+    /// has the same shape for the same reason: its `Pending` carries either an
+    /// entity or a finished record (`native/Adapter/Flattener.cs:719`).
+    pub attribute: Option<&'a acadrust::entities::AttributeEntity>,
     pub at: Xform,
     pub from_block: bool,
 }
@@ -988,25 +1291,91 @@ pub fn expand(doc: &acadrust::document::CadDocument) -> Result<Vec<Placed<'_>>, 
                     t: [0.0, 0.0, 0.0],
                 };
                 let inner = at.then(local);
-                let members: Vec<&EntityType> =
-                    doc.entities_in_block(&d.base().block_name).collect();
+                // A nested INSERT inside a dimension block is NOT walked, and
+                // that is the reference implementation's decision rather than
+                // an omission here: "a dimension block is generated geometry,
+                // not a user block, and walking it as a block would hand it a
+                // second depth budget" (`native/Adapter/Flattener.cs:1447`).
+                // The blocks this skips are the terminators: real_AC1018
+                // places `_BoxBlank` twice and `_ArchTick` twice inside `*D8`
+                // and `*D4`, which is 12 records the recording does not have
+                // and this used to emit.
+                let members: Vec<&EntityType> = doc
+                    .entities_in_block(&d.base().block_name)
+                    .filter(|m| !matches!(m, EntityType::Insert(_)))
+                    .collect();
                 for m in members.into_iter().rev() {
                     stack.push((m, inner, true, depth + 1));
                 }
             }
             EntityType::Insert(i) => {
+                // An ATTRIB belongs to the insertion rather than to the block,
+                // and it is already placed in the frame the insertion sits in,
+                // so it goes out under the PARENT transform. Using `inner`
+                // would transform a point that has already been transformed.
+                // The reference implementation hands them out first, ahead of
+                // the block's own entities (`native/Adapter/Flattener.cs:719`),
+                // and going straight into `out` here is that order: what the
+                // stack holds is popped after this.
+                //
+                // real_AC1018's are the four the comparison was missing:
+                // `MyBlock`'s one value and `my_block_v2`'s three.
+                for a in &i.attributes {
+                    out.push(Placed {
+                        entity: e,
+                        attribute: Some(a),
+                        at,
+                        from_block,
+                    });
+                }
+
                 let inner = at.then(Xform::of_insert(i));
                 let members: Vec<&EntityType> = doc.entities_in_block(&i.block_name).collect();
                 // An unresolved block, an xref most likely. The recording
                 // answers with an UNRESOLVED_BLOCK warning and no geometry, so
                 // contributing nothing here is agreeing with it, not skipping.
-
                 for m in members.into_iter().rev() {
                     stack.push((m, inner, true, depth + 1));
                 }
             }
+            // A TABLE caches what it draws in an anonymous block, and over
+            // there it is expanded because `TableEntity` derives from
+            // `Insert`. Reaching that block is 56 of real_AC1018's 380
+            // records: 31 cell-border lines, 24 cell texts and the one
+            // background polygon, none of which exist on this side otherwise.
+            // The rows and cells the entity itself carries are the table's
+            // data rather than its picture, so nothing is synthesised from
+            // them here: the picture is the block.
+            EntityType::Table(t) => {
+                // The DWG names the cache block by the handle at DXF 343 and
+                // the entity's own `block_name` comes through empty, so the
+                // name has to come out of the block table. Taking the name
+                // when there is one keeps a DXF-sourced table working, where
+                // the reverse holds.
+                let name = if t.block_name.is_empty() {
+                    t.block_record_handle.and_then(|h| {
+                        doc.block_records
+                            .iter()
+                            .find(|br| br.handle == h)
+                            .map(|br| br.name.clone())
+                    })
+                } else {
+                    Some(t.block_name.clone())
+                };
+                // No cache block is a table nothing has drawn yet. The
+                // recording has no records for one either, so contributing
+                // nothing is agreeing with it.
+                if let Some(name) = name {
+                    let inner = at.then(Xform::of_table(t));
+                    let members: Vec<&EntityType> = doc.entities_in_block(&name).collect();
+                    for m in members.into_iter().rev() {
+                        stack.push((m, inner, true, depth + 1));
+                    }
+                }
+            }
             _ => out.push(Placed {
                 entity: e,
+                attribute: None,
                 at,
                 from_block,
             }),
@@ -1061,7 +1430,7 @@ pub fn dump_fixture(dwg: &Path, expectation: &Path) -> Verdict {
         if matches!(p.entity, EntityType::Viewport(_)) {
             continue; // the recording carries no viewport record
         }
-        got.extend(render(p));
+        got.extend(render(&doc, p));
     }
 
     let text = match std::fs::read_to_string(expectation) {
