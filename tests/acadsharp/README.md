@@ -20,6 +20,25 @@ ACADSHARP_CORPUS=target/acadsharp-corpus \
 With no corpus the test skips rather than fails. Fetching it is a network call
 and a crate's suite should not need one to go green.
 
+## Formatting this harness: never `cargo fmt`
+
+Format the one file you touched, with the crate's edition:
+
+```bash
+rustfmt --edition 2021 tests/viprs/mod.rs
+```
+
+`cargo fmt` is the wrong tool here and a path argument does not save you: it ignores the
+argument and formats the whole crate, which rewrites seven `src/` files that have never
+been rustfmt-clean — `current_transparency.rs`, `nested_copy.rs`, `entities/acis/types.rs`,
+`entities/translate.rs`, `io/dxf/reader/section_reader.rs`, `io/dxf/writer/section_writer.rs`
+and `lib.rs`, whose `mod` order it also sorts. All seven are upstream's files at commits
+this fork has in common with it, so reformatting them buys nothing here and costs a
+conflict on every future rebase. That is why they are left alone rather than fixed.
+
+`cargo fmt --check` is safe and is red on those same seven files. `rustfmt --check` on one
+file is the version worth believing.
+
 ## Where it stands
 
 52 fixtures, of which 45 carry a record dump, read from libviprs-dep at the pinned commit.
